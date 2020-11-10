@@ -14,14 +14,12 @@ from cv_bridge import CvBridge, CvBridgeError
 import copy
 from PIL import Image
 import rospkg 
-
+from dt_apriltags import Detector, Detection
 
 """
-
 This is a template that can be used as a starting point for the CRA1 exercise.
 You need to project the model file in the 'models' directory on an AprilTag.
 To help you with that, we have provided you with the Renderer class that render the obj file.
-
 """
 
 class ARNode(DTROS):
@@ -40,11 +38,31 @@ class ARNode(DTROS):
         self.bridge = CvBridge()
 
         # find the calibration parameters
-        self.camera_info = self.load_intrinsics()
-        rospy.loginfo(f'Camera info: {self.camera_info}')
+        self.camera_info_dict = self.load_intrinsics()
+        rospy.loginfo(f'Camera info: {self.camera_info_dict}')
         self.homography = self.load_extrinsics()
         rospy.loginfo(f'Homography: {self.homography}')
         rospy.loginfo("Calibration parameters extracted.")
+
+        # extract parameters from camera_info_dict for apriltag detection
+        f_x = self.camera_info_dict['camera_matrix']['data'][0]
+        f_y = self.camera_info_dict['camera_matrix']['data'][4]
+        c_x = self.camera_info_dict['camera_matrix']['data'][2]
+        c_y = self.camera_info_dict['camera_matrix']['data'][5]
+        self.camera_params = [f_x, f_y, c_x, c_y]
+        K_list = self.camera_info_dict['camera_matrix']['data']
+        self.K = np.array(K_list).reshape((3, 3))
+        print(f'K: {self.K}')
+
+        # initialise the apriltag detector
+        self.at_detector = Detector(searchpath=['apriltags'],
+                           families='tag36h11',
+                           nthreads=1,
+                           quad_decimate=1.0,
+                           quad_sigma=0.0,
+                           refine_edges=1,
+                           decode_sharpening=0.25,
+                           debug=0)
 
         # construct publisher to images
         image_pub_topic = f'/{self.veh}/{node_name}/augmented_image/image/compressed'
@@ -66,22 +84,28 @@ class ARNode(DTROS):
         # extract the image message to a cv image
         image_np = self.readImage(image_msg)
 
-        # detect aprtil tag and extract its reference frame
-        image_gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY) # or BGR?
-        print(type(image_gray))
-        print(image_gray.dtype)
-        # self.detect(image_gray)
+        # detect apriltag and extract its reference frame
+        image_gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+        tags = self.at_detector.detect(image_gray, estimate_tag_pose=False, camera_params=self.camera_params, tag_size=0.065) # returns list of detection objects
 
-        augmented_image = image_gray
+        for tag in tags:
+            H = tag.homography # assume only 1 tag in image
+
+            # Find transformation from april tag to target image frame
+            P = self.projection_matrix(self.K, H)
+
+            # Project model into image frame
+            image_np = self.renderer.render(image_np, P)
 
         # make new CompressedImage to publish
         augmented_image_msg = CompressedImage()
         augmented_image_msg.header.stamp = rospy.Time.now()
         augmented_image_msg.format = "jpeg"
-        augmented_image_msg.data = np.array(cv2.imencode('.jpg', augmented_image)[1]).tostring()
+        augmented_image_msg.data = np.array(cv2.imencode('.jpg', image_np)[1]).tostring()
 
         # Publish new image
         self.image_pub.publish(augmented_image_msg)
+
         rospy.loginfo('Callback completed, publishing image')
 
 
@@ -133,115 +157,38 @@ class ARNode(DTROS):
 
         return calib_data['homography']
 
-
-    def detect(self, img, estimate_tag_pose=False, camera_params=None, tag_size=None):
-
-        '''
-            Run detectons on the provided image. The image must be a grayscale
-            image of type numpy.uint8.
-            estimate_tag_pose ?
-            camera_params: what format?
-            tag_size: 
-        '''
-
-        assert len(img.shape) == 2
-        assert img.dtype == np.uint8
-
-        c_img = self._convert_image(img)
-
-        return_info = []
-
-        # detect apriltags in the image
-        self.libc.apriltag_detector_detect.restype = ctypes.POINTER(_ZArray)
-        detections = self.libc.apriltag_detector_detect(self.tag_detector_ptr, c_img)
-
-        apriltag = ctypes.POINTER(_ApriltagDetection)()
-
-
-        for i in range(0, detections.contents.size):
-
-            #extract the data for each apriltag that was identified
-            zarray_get(detections, i, ctypes.byref(apriltag))
-
-            tag = apriltag.contents
-
-            homography = _matd_get_array(tag.H).copy() # numpy.zeros((3,3))  # Don't ask questions, move on with your life
-            center = numpy.ctypeslib.as_array(tag.c, shape=(2,)).copy()
-            corners = numpy.ctypeslib.as_array(tag.p, shape=(4, 2)).copy()
-
-            detection = Detection()
-            detection.tag_family = ctypes.string_at(tag.family.contents.name)
-            detection.tag_id = tag.id
-            detection.hamming = tag.hamming
-            detection.decision_margin = tag.decision_margin
-            detection.homography = homography
-            detection.center = center
-            detection.corners = corners
-
-            if estimate_tag_pose:
-                if camera_params==None:
-                    raise Exception('camera_params must be provided to detect if estimate_tag_pose is set to True')
-                if tag_size==None:
-                    raise Exception('tag_size must be provided to detect if estimate_tag_pose is set to True')
-
-                camera_fx, camera_fy, camera_cx, camera_cy = [ c for c in camera_params ]
-
-                info = _ApriltagDetectionInfo(det=apriltag,
-                                              tagsize=tag_size,
-                                              fx=camera_fx,
-                                              fy=camera_fy,
-                                              cx=camera_cx,
-                                              cy=camera_cy)
-                pose = _ApriltagPose()
-
-                self.libc.estimate_tag_pose.restype = ctypes.c_double
-                err = self.libc.estimate_tag_pose(ctypes.byref(info), ctypes.byref(pose))
-
-                detection.pose_R = _matd_get_array(pose.R).copy()
-                detection.pose_t = _matd_get_array(pose.t).copy()
-                detection.pose_err = err
-
-
-            #Append this dict to the tag data array
-            return_info.append(detection)
-
-        self.libc.image_u8_destroy.restype = None
-        self.libc.image_u8_destroy(c_img)
-
-        self.libc.apriltag_detections_destroy.restype = None
-        self.libc.apriltag_detections_destroy(detections)
-
-        return return_info
-
-
-    def _convert_image(self, img):
-
-        height = img.shape[0]
-        width = img.shape[1]
-
-        self.libc.image_u8_create.restype = ctypes.POINTER(_ImageU8)
-        c_img = self.libc.image_u8_create(width, height)
-
-        tmp = _image_u8_get_array(c_img)
-
-        # copy the opencv image into the destination array, accounting for the
-        # difference between stride & width.
-        tmp[:, :width] = img
-
-        # tmp goes out of scope here but we don't care because
-        # the underlying data is still in c_img.
-        return c_img
-
     
-    def projection_matrix(self, intrinsic, homography):
+    def projection_matrix(self, K, H):
         """
+            K is the intrinsic camera matrix
+            H is the homography matrix
             Write here the compuatation for the projection matrix, namely the matrix
             that maps the camera reference frame to the AprilTag reference frame.
         """
 
-        #
-        # Write your code here
-        #
+        # find R_1, R_2 and t
+        Kinv = np.linalg.inv(K)
+        r1r2t = np.matmul(Kinv, H) # r1r2t = [r_1 r_2 t]
+        r1r2t = r1r2t / np.linalg.norm(r1r2t[:, 0])
+        r_1 = r1r2t[:, 0]
+        r_2 = r1r2t[:, 1]
+        t = r1r2t[:, 2]
+
+        # Find v_3 vector othogonal to v_1 and v_2
+        r_3 = np.cross(r_1, r_2)
+
+        # Reconstruct R vector
+        R = np.column_stack((r_1, r_2, r_3))
+
+        # Use SVD to make R into an orthogonal matrix
+        _, U, Vt = cv2.SVDecomp(R)
+        R = U @ Vt
+
+        # Combine R, t and K to find P
+        buff = np.column_stack((R, t)) # buff = [r_1 r_2 r_3 t]
+        P = K @ buff
+
+        return P
 
 
     def readImage(self, msg_image):
