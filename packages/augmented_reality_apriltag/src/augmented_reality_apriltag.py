@@ -9,8 +9,9 @@ import rospy
 import yaml
 import sys
 from duckietown.dtros import DTROS, NodeType
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, CameraInfo
 from cv_bridge import CvBridge, CvBridgeError
+import copy
 
 import rospkg 
 
@@ -35,11 +36,128 @@ class ARNode(DTROS):
         # Initialize an instance of Renderer giving the model in input.
         self.renderer = Renderer(rospack.get_path('augmented_reality_apriltag') + '/src/models/duckie.obj')
 
-        #
-        #   Write your code here
-        #
+        # find the calibration parameters
+        self.camera_info = self.load_intrinsics()
+        rospy.loginfo(f'Camera info: {self.camera_info}')
+        self.homography = self.load_extrinsics()
+        rospy.loginfo(f'Homography: {self.homography}')
+        rospy.loginfo("Calibration parameters extracted.")
+
+        # construct publisher to images
+        image_pub_topic = f'/{self.veh}/{node_name}/augmented_image/image/compressed'
+        self.image_pub = rospy.Publisher(image_pub_topic, CompressedImage, queue_size=16)
+        rospy.loginfo(f'Publishing to: {image_pub_topic}')
+
+        # construct subscriber to images
+        image_sub_topic = f'/{self.veh}/camera_node/image/compressed'
+        self.image_sub = rospy.Subscriber(image_sub_topic, CompressedImage, self.callback)
+        rospy.loginfo(f'Subscribed to: {image_sub_topic}')
 
 
+    def callback(self, image_data):
+        """ Once recieving the image, save the data in the correct format
+            is it okay to do a lot of computation in the callback?
+        """
+        rospy.loginfo('Image recieved, running callback.')
+
+        # Extract the image from the subscriber into a numpy array
+        np_arr = np.fromstring(image_data.data, np.uint8)
+        # image_np = cv2.imdecode(np_arr, cv2.CV_LOAD_IMAGE_COLOR) # OpenCV < 3
+        image_np = cv2.imdecode(np_arr, cv2.IMREAD_COLOR) # OpenCV >= 3.0:
+
+        augmented_image = image_np
+
+        # make new CompressedImage to publish
+        augmented_image_msg = CompressedImage()
+        augmented_image_msg.header.stamp = rospy.Time.now()
+        augmented_image_msg.format = "jpeg"
+        augmented_image_msg.data = np.array(cv2.imencode('.jpg', augmented_image)[1]).tostring()
+        # Publish new image
+        self.image_pub.publish(augmented_image_msg)
+        rospy.loginfo('Callback completed, publishing image')
+
+
+    @staticmethod
+    def load_camera_info(filename):
+        """Loads the camera calibration files.
+        Loads the intrinsic and extrinsic camera matrices.
+        Args:
+            filename (:obj:`str`): filename of calibration files.
+        Returns:
+            :obj:`CameraInfo`: a CameraInfo message object
+        """
+        with open(filename, 'r') as stream:
+            calib_data = yaml.load(stream, Loader=yaml.Loader)
+        cam_info = CameraInfo()
+        cam_info.width = calib_data['image_width']
+        cam_info.height = calib_data['image_height']
+        cam_info.K = calib_data['camera_matrix']['data']
+        cam_info.D = calib_data['distortion_coefficients']['data']
+        cam_info.R = calib_data['rectification_matrix']['data']
+        cam_info.P = calib_data['projection_matrix']['data']
+        cam_info.distortion_model = calib_data['distortion_model']
+        return cam_info
+
+
+    def load_intrinsics(self):
+        # Find the calibration parameters
+        self.cali_file_folder = '/data/config/calibrations/camera_intrinsic/'
+        self.frame_id = rospy.get_namespace().strip('/') + '/camera_optical_frame'
+        self.cali_file = self.cali_file_folder + rospy.get_namespace().strip("/") + ".yaml"
+
+        # Locate calibration yaml file or use the default otherwise
+        rospy.loginfo(f'Looking for calibration {self.cali_file}')
+        if not os.path.isfile(self.cali_file):
+            self.logwarn("Calibration not found: %s.\n Using default instead." % self.cali_file)
+            
+            
+        self.cali_file = (self.cali_file_folder + "default.yaml")
+
+        # Shutdown if no calibration file not found
+        if not os.path.isfile(self.cali_file):
+            rospy.signal_shutdown("Found no calibration file ... aborting")
+
+        # Load the calibration file
+        original_camera_info = self.load_camera_info(self.cali_file)
+        original_camera_info.header.frame_id = self.frame_id
+        current_camera_info = copy.deepcopy(original_camera_info)
+        # self.update_camera_params() # only used if camera is a different res?
+        self.log("Using calibration file: %s" % self.cali_file)
+
+        return current_camera_info
+
+
+    def load_extrinsics(self):
+        """
+        Loads the homography matrix from the extrinsic calibration file.
+        Returns:
+            :obj:`numpy array`: the loaded homography matrix
+        """
+        # load intrinsic calibration
+        cali_file_folder = '/data/config/calibrations/camera_extrinsic/'
+        cali_file = cali_file_folder + rospy.get_namespace().strip("/") + ".yaml"
+
+        # Locate calibration yaml file or use the default otherwise
+        if not os.path.isfile(cali_file):
+            self.log("Can't find calibration file: %s.\n Using default calibration instead."
+                     % cali_file, 'warn')
+            cali_file = (cali_file_folder + "default.yaml")
+
+        # Shutdown if calibration file not found
+        if not os.path.isfile(cali_file):
+            msg = 'Found no calibration file ... aborting'
+            self.log(msg, 'err')
+            rospy.signal_shutdown(msg)
+
+        try:
+            with open(cali_file,'r') as stream:
+                calib_data = yaml.load(stream, Loader=yaml.Loader)
+        except yaml.YAMLError:
+            msg = 'Error in parsing calibration file %s ... aborting' % cali_file
+            self.log(msg, 'err')
+            rospy.signal_shutdown(msg)
+
+        return calib_data['homography']
 
     
     def projection_matrix(self, intrinsic, homography):
@@ -51,6 +169,7 @@ class ARNode(DTROS):
         #
         # Write your code here
         #
+
 
     def readImage(self, msg_image):
         """
@@ -67,6 +186,7 @@ class ARNode(DTROS):
             self.log(e)
             return []
 
+
     def readYamlFile(self,fname):
         """
             Reads the 'fname' yaml file and returns a dictionary with its input.
@@ -81,7 +201,7 @@ class ARNode(DTROS):
             except yaml.YAMLError as exc:
                 self.log("YAML syntax error. File: %s fname. Exc: %s"
                          %(fname, exc), type='fatal')
-                rospy.signal_shutdown()
+                rospy.signal_shutdown('No calibration file found.')
                 return
 
 
